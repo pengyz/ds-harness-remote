@@ -68,6 +68,31 @@ const prepareScenario1 = () => {
 beforeEach(prepareScenario1)
 
 describe('ordered history recovery', () => {
+  it('retires adopted rows the client never marked queued when the Host drops them', async () => {
+    // The send-time snapshot said "idle" (no local queued verdict) while the
+    // Host queued the prompt anyway; another device removes it. The adopted
+    // row must retire visibly instead of staying hidden with no verdict.
+    prepareScenario1()
+    const idle = { ...session, running: false }
+    useAppStore.setState({ selectedSession: idle, sessions: [idle] })
+    proxy.sessionPrompt.mockResolvedValue(undefined)
+    const rpcId = 'adoption-idle-removed'
+    const sending = useAppStore.getState().sendMessage('idle prompt', [], rpcId)
+    const projectInbox = (value: unknown, seq: number) => useAppStore.getState().handleMuxFrame({ rpcId: '',
+      payload: { type: 'session/projection', sessionId: 's1', key: 'inbox', seq, value } } as MuxStreamFrame)
+    const inbox = { 'next-turn': [{ id: 'host-item', source: { kind: 'user', rpcId },
+      content: [{ type: 'text', text: 'idle prompt' }] }] }
+    expect(await sending).toBe('sent')
+    projectInbox(inbox, 1)
+    const row = () => useAppStore.getState().messages.s1?.[0]
+    // Adopted and hidden while queued, with no local verdict of its own.
+    expect(row()).toMatchObject({ queuedAdopted: true, sendState: undefined })
+    projectInbox({ 'next-turn': [] }, 2)
+    projectInbox({ 'next-turn': [] }, 3)
+    // Dropped by the Host: one projection of grace, then a visible verdict.
+    expect(row()).toMatchObject({ queuedAdopted: true, sendState: 'canceled' })
+  })
+
   it('adopts only undelivered rows across any ordering of the inbox, prompt acknowledgement and echo', async () => {
     await runScenarios(['inbox-first', 'ack-first', 'echo-first'].map(order => ({ name: order, run: async () => {
       prepareScenario1()

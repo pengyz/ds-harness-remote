@@ -2248,9 +2248,14 @@ export const useAppStore = create<AppState>((set, get) => ({
             // whose echo already replaced the row; marking that delivered Host
             // row would hide it, and no later update clears the mark.
             const adopt = mark.has(item.requestRpcId) && item.id === optimisticMessageId(item.requestRpcId)
-            // Delivered rows carry no sendState, so retirement is local-only too.
+            // Delivered rows carry neither sendState nor the adoption mark, so
+            // retirement is local-only too. An adopted row the client never
+            // marked queued (its send-time snapshot said the session was idle
+            // while the Host queued it anyway) is settled the same way once the
+            // Host drops it — otherwise it stays hidden with no verdict.
             const cancel = retire.has(item.requestRpcId)
-              && (item.sendState === 'queued' || item.sendState === 'unconfirmed' || item.sendState === 'failed')
+              && (item.sendState === 'queued' || item.sendState === 'unconfirmed' || item.sendState === 'failed'
+                || (item.queuedAdopted === true && item.sendState === undefined))
             return adopt || cancel ? {
               ...item,
               ...(adopt ? { queuedAdopted: true as const } : {}),
