@@ -324,6 +324,15 @@ function clearQueueAdoption(): void {
   // survives reconnects; only the grace window restarts.
   vanishingQueueRpcIds.clear()
 }
+
+/**
+ * Id of the local optimistic row for one prompt. Its `user/message` echo
+ * replaces that row under the Host message id, so a row still carrying this id
+ * is undelivered — a delivered row keeps the rpcId but never this id.
+ */
+function optimisticMessageId(requestRpcId: string): string {
+  return `local:${requestRpcId}`
+}
 let sessionLoadGeneration = 0
 let reconnectFlight: Promise<boolean> | undefined
 
@@ -1701,7 +1710,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // `local:` prefix is load-bearing for mergeCodexLive's optimistic matching;
       // the rpcId suffix keeps the id unique when several prompts are queued in
       // the same millisecond (duplicate keys corrupt the merged timeline).
-      id: `local:${requestRpcId}`,
+      id: optimisticMessageId(requestRpcId),
       sessionId: session.sessionId,
       role: 'user',
       text,
@@ -2231,16 +2240,23 @@ export const useAppStore = create<AppState>((set, get) => ({
           adoptedQueueRpcIds.set(sessionId, adopted)
           vanishingQueueRpcIds.set(sessionId, vanishing)
           if (mark.size === 0 && retire.size === 0) return undefined
-          return (items: ChatItem[]): ChatItem[] => items.map(item =>
-            item.kind === 'message' && item.requestRpcId !== undefined
-            && (mark.has(item.requestRpcId) || (retire.has(item.requestRpcId)
-              && (item.sendState === 'queued' || item.sendState === 'unconfirmed' || item.sendState === 'failed')))
-              ? {
-                  ...item,
-                  ...(mark.has(item.requestRpcId) ? { queuedAdopted: true as const } : {}),
-                  ...(retire.has(item.requestRpcId) ? { sendState: 'canceled' as const } : {}),
-                }
-              : item)
+          return (items: ChatItem[]): ChatItem[] => items.map(item => {
+            if (item.kind !== 'message' || item.requestRpcId === undefined) return item
+            // Only the undelivered local row can be waiting in the Host queue.
+            // The echo (session/follow) and the inbox (session/control) arrive
+            // on independent pumps, so a delayed inbox may still list a prompt
+            // whose echo already replaced the row; marking that delivered Host
+            // row would hide it, and no later update clears the mark.
+            const adopt = mark.has(item.requestRpcId) && item.id === optimisticMessageId(item.requestRpcId)
+            // Delivered rows carry no sendState, so retirement is local-only too.
+            const cancel = retire.has(item.requestRpcId)
+              && (item.sendState === 'queued' || item.sendState === 'unconfirmed' || item.sendState === 'failed')
+            return adopt || cancel ? {
+              ...item,
+              ...(adopt ? { queuedAdopted: true as const } : {}),
+              ...(cancel ? { sendState: 'canceled' as const } : {}),
+            } : item
+          })
         })() : undefined
         return {
           sessions: state.sessions.map(update),

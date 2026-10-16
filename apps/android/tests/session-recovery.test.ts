@@ -68,8 +68,8 @@ const prepareScenario1 = () => {
 beforeEach(prepareScenario1)
 
 describe('ordered history recovery', () => {
-  it('retains queue adoption across either ordering of the inbox and prompt acknowledgement', async () => {
-    await runScenarios(['inbox-first', 'ack-first'].map(order => ({ name: order, run: async () => {
+  it('adopts only undelivered rows across any ordering of the inbox, prompt acknowledgement and echo', async () => {
+    await runScenarios(['inbox-first', 'ack-first', 'echo-first'].map(order => ({ name: order, run: async () => {
       prepareScenario1()
       const running = { ...session, running: true }
       useAppStore.setState({ selectedSession: running, sessions: [running] })
@@ -81,17 +81,33 @@ describe('ordered history recovery', () => {
         payload: { type: 'session/projection', sessionId: 's1', key: 'inbox', seq, value } } as MuxStreamFrame)
       const inbox = { 'next-turn': [{ id: 'host-item', source: { kind: 'user', rpcId },
         content: [{ type: 'text', text: 'queued prompt' }] }] }
-      if (order === 'inbox-first') projectInbox(inbox, 1)
+      // session/follow (echo) and session/control (inbox) are pumped
+      // independently: a delayed inbox can still list an already-echoed prompt,
+      // and the acknowledgement may land after both.
+      if (order === 'echo-first') useAppStore.getState().handleMuxFrame(frame(entry('user/message', 4, { turn: 2,
+        message: { id: 'host-delivered', source: { kind: 'user', rpcId }, content: [{ type: 'text', text: 'queued prompt' }] } })))
+      if (order !== 'ack-first') projectInbox(inbox, 1)
       acknowledge()
       expect(await sending).toBe('sent')
       if (order === 'ack-first') projectInbox(inbox, 1)
-      expect(useAppStore.getState().messages.s1?.[0]).toMatchObject({ requestRpcId: rpcId,
-        sendState: 'queued', queuedAdopted: true })
-      // Another device removes it; one projection of grace prevents racing its echo.
+      const delivery = () => {
+        const row = useAppStore.getState().messages.s1?.[0]
+        return row?.kind === 'message'
+          ? { id: row.id, requestRpcId: row.requestRpcId, sendState: row.sendState, queuedAdopted: row.queuedAdopted }
+          : row
+      }
+      const queued = { id: `local:${rpcId}`, requestRpcId: rpcId, sendState: 'queued', queuedAdopted: true }
+      // The echo replaced the local row: the delivered Host row must take neither
+      // the adoption mark nor a verdict (with no sendState the mark alone hides it).
+      const delivered = { id: 'host-delivered', requestRpcId: rpcId, sendState: undefined, queuedAdopted: undefined }
+      expect(delivery()).toEqual(order === 'echo-first' ? delivered : queued)
+      // The prompt leaves the inbox (removed elsewhere, or consumed after its
+      // echo); one projection of grace prevents racing its echo.
       projectInbox({ 'next-turn': [] }, 2)
-      expect(useAppStore.getState().messages.s1?.[0]).toMatchObject({ queuedAdopted: true })
+      expect(delivery()).toEqual(order === 'echo-first' ? delivered : queued)
       projectInbox({ 'next-turn': [] }, 3)
-      expect(useAppStore.getState().messages.s1?.[0]).toMatchObject({ sendState: 'canceled', queuedAdopted: true })
+      expect(delivery()).toEqual(order === 'echo-first' ? delivered : { ...queued, sendState: 'canceled' })
+      expect(useAppStore.getState().messages.s1).toHaveLength(1)
     } })))
   })
 
